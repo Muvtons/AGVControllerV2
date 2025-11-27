@@ -1,5 +1,5 @@
-#ifndef AGV_CONTROLLER_H
-#define AGV_CONTROLLER_H
+#ifndef AGV_CONTROLLERV2_H
+#define AGV_CONTROLLERV2_H
 
 #include <Arduino.h>
 
