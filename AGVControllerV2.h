@@ -1,64 +1,70 @@
-#ifndef AGV_CONTROLLERV2_H
-#define AGV_CONTROLLERV2_H
+#ifndef AGV_CONTROLLER_V2_H
+#define AGV_CONTROLLER_V2_H
 
-#include <Arduino.h>
+#include <WebServer.h>
+#include <WebSocketsServer.h>
+#include <DNSServer.h>
+#include <Preferences.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
+#include <freertos/semphr.h>
 
 class AGVController {
 public:
     AGVController();
-    void begin(); // Initializes everything and starts tasks
+    void begin();
     
 private:
     static AGVController* _instance;
     
-    // RTOS Objects
-    TaskHandle_t _taskSerialHandle = nullptr;
-    TaskHandle_t _taskWebHandle = nullptr;
-    QueueHandle_t _serialQueue = nullptr;
-    SemaphoreHandle_t _printMutex = nullptr;
+    // Web components
+    WebServer* _server;
+    WebSocketsServer* _webSocket;
+    DNSServer* _dnsServer;
     
-    // State
-    volatile bool _isAPMode = false;
-    String _sessionToken;
+    // RTOS components
+    QueueHandle_t _serialQueue;
+    SemaphoreHandle_t _printMutex;
+    TaskHandle_t _taskWebHandle;
+    TaskHandle_t _taskSerialHandle;
+    
+    // Configuration
+    bool _isAPMode;
     String _storedSSID;
     String _storedPassword;
+    String _sessionToken;
     
-    // Network Objects
-    WebServer* _server = nullptr;
-    WebSocketsServer* _webSocket = nullptr;
-    DNSServer* _dnsServer = nullptr;
-    
-    // Preferences
-    Preferences _prefs;
-    
-    // Task Wrappers
-    static void _serialTask(void* pvParameters);
-    static void _webTask(void* pvParameters);
-    
-    // Event Handlers
-    static void _handleRoot();
-    static void _handleLogin();
-    static void _handleDashboard();
-    static void _handleWiFiSetup();
-    static void _handleScan();
-    static void _handleSaveWiFi();
-    static void _handleCaptivePortal();
-    static void _webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length);
-    
-    // Internal Methods
-    void _loadCredentials();
-    void _saveCredentials(const String& ssid, const String& pass);
-    void _startAPMode();
-    void _startStationMode();
-    String _generateSessionToken();
-    void _safePrintln(const String& msg);
-    
-    // HTML Pages (PROGMEM)
+    // Static HTML pages
     static const char _loginPage[];
     static const char _wifiSetupPage[];
     static const char _mainPage[];
+    
+    // Task functions
+    static void _serialTask(void* pvParameters);
+    static void _webTask(void* pvParameters);
+    
+    // Web handlers
+    void _handleLogin();
+    void _handleScan();
+    void _handleSaveWiFi();
+    void _handleCaptivePortal();
+    
+    // WebSocket handler
+    void _webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length);
+    
+    // WiFi functions
+    void _startAPMode();
+    void _startStationMode();
+    
+    // Utility functions
+    void _loadCredentials();
+    void _saveCredentials(const String& ssid, const String& pass);
+    String _generateSessionToken();
+    void _safePrintln(const String& msg);
+    void _safePrint(const String& msg);
 };
 
-extern AGVController AGV; // Global instance for easy access
+extern AGVController AGV;
 
 #endif
