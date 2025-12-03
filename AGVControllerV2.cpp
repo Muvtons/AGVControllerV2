@@ -110,11 +110,13 @@ window.onload=function(){checkAuth();addLog('🔧 AGV Control Interface Initiali
 )rawliteral";
 
 // ===== CONSTRUCTOR =====
+// Also update the constructor to initialize the new queue:
 AGVController::AGVController() :
     _server(nullptr),
     _webSocket(nullptr),
     _dnsServer(nullptr),
-    _serialQueue(nullptr),
+    _webQueue(nullptr),
+    _outgoingWebQueue(nullptr),  // Initialize new queue pointer
     _printMutex(nullptr),
     _taskWebHandle(nullptr),
     _taskSerialHandle(nullptr),
@@ -126,22 +128,19 @@ AGVController::AGVController() :
 }
 
 // ===== PUBLIC METHODS =====
+// Update begin() method to create the new queue:
 void AGVController::begin() {
     Serial.begin(115200);
     delay(1000);
     _safePrintln("\n\nESP32-S3 AGV Controller Library v2.0\n");
     
     // Initialize RTOS objects
-    _serialQueue = xQueueCreate(20, sizeof(char[256]));
+    _webQueue = xQueueCreate(20, sizeof(char[256]));
+    _outgoingWebQueue = xQueueCreate(20, sizeof(char[256]));  // Create new queue
     _printMutex = xSemaphoreCreateMutex();
     
-    if (_serialQueue == NULL) {
-        Serial.println("ERROR: Failed to create serial queue!");
-        return;
-    }
-    
-    if (_printMutex == NULL) {
-        Serial.println("ERROR: Failed to create print mutex!");
+    if (_webQueue == NULL || _outgoingWebQueue == NULL) {
+        Serial.println("ERROR: Failed to create queues!");
         return;
     }
     
@@ -277,6 +276,7 @@ void AGVController::_webTask(void* pvParameters) {
     }
     
     // Main loop
+// Main loop
     for(;;) {
         if(ctrl->_isAPMode) {
             ctrl->_dnsServer->processNextRequest();
@@ -284,18 +284,25 @@ void AGVController::_webTask(void* pvParameters) {
         
         ctrl->_server->handleClient();
         
-        if(ctrl->_webSocket && !ctrl->_isAPMode) {
+        if(!ctrl->_isAPMode && ctrl->_webSocket != nullptr) {
             ctrl->_webSocket->loop();
             
-            // Process serial queue
+            // Process serial queue (incoming from USB)
             char buffer[256];
-            while(xQueueReceive(ctrl->_serialQueue, &buffer, 0) == pdTRUE) {
+            while(xQueueReceive(ctrl->_webQueue, &buffer, 0) == pdTRUE) {
                 ctrl->_webSocket->broadcastTXT(buffer);
+            }
+            
+            // Process outgoing web queue (from sendToWeb())
+            while(xQueueReceive(ctrl->_outgoingWebQueue, &buffer, 0) == pdTRUE) {
+                ctrl->_webSocket->broadcastTXT(buffer);
+                ctrl->_safePrintln("[WEB->BROWSER] " + String(buffer));
             }
         }
         
         vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(1));
     }
+
 }
 
 // ===== WEB HANDLERS =====
@@ -492,5 +499,33 @@ void AGVController::_safePrint(const String& msg) {
     if(xSemaphoreTake(_printMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
         Serial.print(msg);
         xSemaphoreGive(_printMutex);
+    }
+}
+
+
+// ===== NEW PUBLIC METHOD =====
+void AGVController::sendToWeb(const String& message) {
+    // Safety checks
+    if (_outgoingWebQueue == nullptr) {
+        _safePrintln("[ERROR] Outgoing web queue not initialized");
+        return;
+    }
+    
+    if (message.length() == 0) {
+        return;  // Don't send empty messages
+    }
+    
+    // Prepare message for queue (limit to 255 chars for safety)
+    char buffer[256];
+    size_t len = message.length();
+    if (len > 255) len = 255;
+    strncpy(buffer, message.c_str(), len);
+    buffer[len] = '\0';
+    
+    // Send to queue (non-blocking, 0 tick timeout)
+    BaseType_t result = xQueueSend(_outgoingWebQueue, &buffer, 0);
+    
+    if (result != pdTRUE) {
+        _safePrintln("[WARNING] Outgoing web queue full, message dropped: " + message.substring(0, 30) + "...");
     }
 }
