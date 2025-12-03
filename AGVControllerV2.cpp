@@ -110,7 +110,18 @@ window.onload=function(){checkAuth();addLog('🔧 AGV Control Interface Initiali
 )rawliteral";
 
 // ===== CONSTRUCTOR =====
-AGVController::AGVController() {
+AGVController::AGVController() :
+    _server(nullptr),
+    _webSocket(nullptr),
+    _dnsServer(nullptr),
+    _serialQueue(nullptr),
+    _printMutex(nullptr),
+    _taskWebHandle(nullptr),
+    _taskSerialHandle(nullptr),
+    _isAPMode(false),
+    _storedSSID(""),
+    _storedPassword(""),
+    _sessionToken("") {
     _instance = this;
 }
 
@@ -121,13 +132,23 @@ void AGVController::begin() {
     _safePrintln("\n\nESP32-S3 AGV Controller Library v2.0\n");
     
     // Initialize RTOS objects
-    _serialQueue = xQueueCreate(20, 256);
+    _serialQueue = xQueueCreate(20, sizeof(char[256]));
     _printMutex = xSemaphoreCreateMutex();
+    
+    if (_serialQueue == NULL) {
+        Serial.println("ERROR: Failed to create serial queue!");
+        return;
+    }
+    
+    if (_printMutex == NULL) {
+        Serial.println("ERROR: Failed to create print mutex!");
+        return;
+    }
     
     // Load WiFi credentials
     _loadCredentials();
     
-    // Create tasks
+    // Create tasks - BOTH ON CORE 0 as requested
     xTaskCreatePinnedToCore(
         _serialTask,
         "AGV_SerialMgr",
@@ -135,7 +156,7 @@ void AGVController::begin() {
         nullptr,
         3,  // High priority
         &_taskSerialHandle,
-        1   // Core 1
+        0   // Core 0 (both tasks on same core)
     );
     
     xTaskCreatePinnedToCore(
@@ -155,17 +176,35 @@ void AGVController::_serialTask(void* pvParameters) {
     char buffer[256];
     
     for(;;) {
-        size_t len = Serial.readBytesUntil('\n', buffer, 255);
-        if(len > 0) {
-            buffer[len] = '\0';
-            xQueueSend(ctrl->_serialQueue, &buffer, 0);
-            
-            if(xSemaphoreTake(ctrl->_printMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-                Serial.printf("\n[SERIAL->WEB] %s\n", buffer);
-                xSemaphoreGive(ctrl->_printMutex);
+        if (Serial.available() > 0) {
+            size_t len = Serial.readBytesUntil('\n', buffer, 255);
+            if(len > 0) {
+                buffer[len] = '\0';
+                
+                // Remove trailing carriage return if present
+                if (buffer[len-1] == '\r') {
+                    buffer[len-1] = '\0';
+                    len--;
+                }
+                
+                char sendBuffer[256];
+                strncpy(sendBuffer, buffer, sizeof(sendBuffer)-1);
+                sendBuffer[sizeof(sendBuffer)-1] = '\0';
+                
+                if (xQueueSend(ctrl->_serialQueue, &sendBuffer, 0) != pdPASS) {
+                    if(xSemaphoreTake(ctrl->_printMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                        Serial.println("[ERROR] Serial queue full!");
+                        xSemaphoreGive(ctrl->_printMutex);
+                    }
+                }
+                
+                if(xSemaphoreTake(ctrl->_printMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                    Serial.printf("\n[SERIAL->WEB] %s\n", buffer);
+                    xSemaphoreGive(ctrl->_printMutex);
+                }
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(1));
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
@@ -174,22 +213,61 @@ void AGVController::_webTask(void* pvParameters) {
     TickType_t lastWake = xTaskGetTickCount();
     
     // Wait for begin() to complete setup
-    vTaskDelay(pdMS_TO_TICKS(100));
+    vTaskDelay(pdMS_TO_TICKS(500));
     
     // Initialize servers
     ctrl->_server = new WebServer(80);
     ctrl->_webSocket = new WebSocketsServer(81);
     ctrl->_dnsServer = new DNSServer();
     
-    // Setup routes
-    ctrl->_server->on("/", HTTP_GET, _handleRoot);
-    ctrl->_server->on("/login", HTTP_POST, _handleLogin);
-    ctrl->_server->on("/dashboard", HTTP_GET, _handleDashboard);
-    ctrl->_server->on("/scan", HTTP_GET, _handleScan);
-    ctrl->_server->on("/savewifi", HTTP_POST, _handleSaveWiFi);
-    ctrl->_server->onNotFound(_handleCaptivePortal);
+    // Setup routes - make sure all handlers are static
+    ctrl->_server->on("/", HTTP_GET, []() {
+        if (AGVController::_instance) {
+            AGVController::_instance->_server->send_P(200, "text/html", AGVController::_instance->_loginPage);
+        }
+    });
     
-    ctrl->_webSocket->onEvent(_webSocketEvent);
+    ctrl->_server->on("/login", HTTP_POST, []() {
+        if (AGVController::_instance) {
+            AGVController::_instance->_handleLogin();
+        }
+    });
+    
+    ctrl->_server->on("/dashboard", HTTP_GET, []() {
+        if (AGVController::_instance) {
+            AGVController::_instance->_server->send_P(200, "text/html", AGVController::_instance->_mainPage);
+        }
+    });
+    
+    ctrl->_server->on("/setup", HTTP_GET, []() {
+        if (AGVController::_instance) {
+            AGVController::_instance->_server->send_P(200, "text/html", AGVController::_instance->_wifiSetupPage);
+        }
+    });
+    
+    ctrl->_server->on("/scan", HTTP_GET, []() {
+        if (AGVController::_instance) {
+            AGVController::_instance->_handleScan();
+        }
+    });
+    
+    ctrl->_server->on("/savewifi", HTTP_POST, []() {
+        if (AGVController::_instance) {
+            AGVController::_instance->_handleSaveWiFi();
+        }
+    });
+    
+    ctrl->_server->onNotFound([]() {
+        if (AGVController::_instance) {
+            AGVController::_instance->_handleCaptivePortal();
+        }
+    });
+    
+    ctrl->_webSocket->onEvent([](uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
+        if (AGVController::_instance) {
+            AGVController::_instance->_webSocketEvent(num, type, payload, length);
+        }
+    });
     
     // Start WiFi mode
     if(ctrl->_storedSSID.length() > 0) {
@@ -206,7 +284,7 @@ void AGVController::_webTask(void* pvParameters) {
         
         ctrl->_server->handleClient();
         
-        if(!ctrl->_isAPMode) {
+        if(ctrl->_webSocket && !ctrl->_isAPMode) {
             ctrl->_webSocket->loop();
             
             // Process serial queue
@@ -221,68 +299,61 @@ void AGVController::_webTask(void* pvParameters) {
 }
 
 // ===== WEB HANDLERS =====
-void AGVController::_handleRoot() {
-    AGVController* ctrl = AGVController::_instance;
-    ctrl->_server->send_P(200, "text/html", ctrl->_loginPage);
-}
-
 void AGVController::_handleLogin() {
-    AGVController* ctrl = AGVController::_instance;
-    if(ctrl->_server->method() == HTTP_POST) {
-        String body = ctrl->_server->arg("plain");
+    if(_server->method() == HTTP_POST) {
+        String body = _server->arg("plain");
         int uStart = body.indexOf("\"username\":\"") + 12;
         int uEnd = body.indexOf("\"", uStart);
         int pStart = body.indexOf("\"password\":\"") + 12;
         int pEnd = body.indexOf("\"", pStart);
         
+        if (uStart == -1 || uEnd == -1 || pStart == -1 || pEnd == -1) {
+            _server->send(400, "application/json", "{\"success\":false}");
+            return;
+        }
+        
         String username = body.substring(uStart, uEnd);
         String password = body.substring(pStart, pEnd);
         
         if(username == "admin" && password == "admin123") {
-            ctrl->_sessionToken = ctrl->_generateSessionToken();
-            ctrl->_server->send(200, "application/json", "{\"success\":true,\"token\":\"" + ctrl->_sessionToken + "\"}");
+            _sessionToken = _generateSessionToken();
+            _server->send(200, "application/json", "{\"success\":true,\"token\":\"" + _sessionToken + "\"}");
         } else {
-            ctrl->_server->send(200, "application/json", "{\"success\":false}");
+            _server->send(200, "application/json", "{\"success\":false}");
         }
     }
 }
 
-void AGVController::_handleDashboard() {
-    AGVController* ctrl = AGVController::_instance;
-    ctrl->_server->send_P(200, "text/html", ctrl->_mainPage);
-}
-
-void AGVController::_handleWiFiSetup() {
-    AGVController* ctrl = AGVController::_instance;
-    ctrl->_server->send_P(200, "text/html", ctrl->_wifiSetupPage);
-}
-
 void AGVController::_handleScan() {
-    AGVController* ctrl = AGVController::_instance;
-    int n = WiFi.scanNetworks();
+    int n = WiFi.scanNetworks(false, true);  // async=false, show_hidden=true
     String json = "[";
     for(int i = 0; i < n; i++) {
         if(i > 0) json += ",";
         json += "{\"ssid\":\"" + WiFi.SSID(i) + "\",\"rssi\":" + String(WiFi.RSSI(i)) + ",\"secured\":" + String(WiFi.encryptionType(i) != WIFI_AUTH_OPEN ? "true" : "false") + "}";
     }
     json += "]";
-    ctrl->_server->send(200, "application/json", json);
+    _server->send(200, "application/json", json);
+    WiFi.scanDelete();  // Clear scan results
 }
 
 void AGVController::_handleSaveWiFi() {
-    AGVController* ctrl = AGVController::_instance;
-    if(ctrl->_server->method() == HTTP_POST) {
-        String body = ctrl->_server->arg("plain");
+    if(_server->method() == HTTP_POST) {
+        String body = _server->arg("plain");
         int ssidStart = body.indexOf("\"ssid\":\"") + 8;
         int ssidEnd = body.indexOf("\"", ssidStart);
         int passStart = body.indexOf("\"password\":\"") + 12;
         int passEnd = body.indexOf("\"", passStart);
         
+        if (ssidStart == -1 || ssidEnd == -1 || passStart == -1 || passEnd == -1) {
+            _server->send(400, "application/json", "{\"success\":false}");
+            return;
+        }
+        
         String ssid = body.substring(ssidStart, ssidEnd);
         String pass = body.substring(passStart, passEnd);
         
-        ctrl->_saveCredentials(ssid, pass);
-        ctrl->_server->send(200, "application/json", "{\"success\":true}");
+        _saveCredentials(ssid, pass);
+        _server->send(200, "application/json", "{\"success\":true}");
         
         vTaskDelay(pdMS_TO_TICKS(1000));
         ESP.restart();
@@ -290,28 +361,40 @@ void AGVController::_handleSaveWiFi() {
 }
 
 void AGVController::_handleCaptivePortal() {
-    AGVController* ctrl = AGVController::_instance;
-    ctrl->_server->sendHeader("Location", "http://192.168.4.1/setup", true);
-    ctrl->_server->send(302, "text/plain", "");
+    if (_isAPMode) {
+        _server->sendHeader("Location", "http://192.168.4.1/setup", true);
+        _server->send(302, "text/plain", "");
+    } else {
+        _server->send(404, "text/plain", "File Not Found");
+    }
 }
 
 void AGVController::_webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
-    AGVController* ctrl = AGVController::_instance;
-    
     switch(type) {
         case WStype_DISCONNECTED:
-            ctrl->_safePrintln("[WebSocket] Client #" + String(num) + " disconnected");
+            _safePrintln("[WebSocket] Client #" + String(num) + " disconnected");
             break;
             
         case WStype_CONNECTED:
-            ctrl->_safePrintln("[WebSocket] Client #" + String(num) + " connected from " + ctrl->_webSocket->remoteIP(num).toString());
-            ctrl->_webSocket->sendTXT(num, "ESP32 Connected - Ready for commands");
+            _safePrintln("[WebSocket] Client #" + String(num) + " connected from " + _webSocket->remoteIP(num).toString());
+            _webSocket->sendTXT(num, "ESP32 Connected - Ready for commands");
             break;
             
-        case WStype_TEXT:
-            ctrl->_safePrintln("\n[WEB->SERIAL] " + String((char*)payload));
-            String response = "Received: " + String((char*)payload);
-            ctrl->_webSocket->sendTXT(num, response);
+        case WStype_TEXT: {
+            String message = String((char*)payload);
+            _safePrintln("\n[WEB->SERIAL] " + message);
+            String response = "Received: " + message;
+            _webSocket->sendTXT(num, response);
+            
+            // Also echo to Serial
+            if(xSemaphoreTake(_printMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                Serial.println("\n[WEB->AGV] " + message);
+                xSemaphoreGive(_printMutex);
+            }
+            break;
+        }
+            
+        default:
             break;
     }
 }
@@ -330,26 +413,29 @@ void AGVController::_startAPMode() {
     
     _dnsServer->start(53, "*", IP);
     _server->begin();
-    _isAPMode = true;
 }
 
 void AGVController::_startStationMode() {
-    _isAPMode = false;
     WiFi.mode(WIFI_STA);
     WiFi.begin(_storedSSID.c_str(), _storedPassword.c_str());
     
+    _safePrintln("Connecting to WiFi: " + _storedSSID);
+    
     int attempts = 0;
-    while(WiFi.status() != WL_CONNECTED && attempts < 20) {
+    while(WiFi.status() != WL_CONNECTED && attempts < 30) {
         vTaskDelay(pdMS_TO_TICKS(500));
+        _safePrint(".");
         attempts++;
     }
     
     if(WiFi.status() == WL_CONNECTED) {
+        _isAPMode = false;
         _safePrintln("\n========================================\n  STARTING STATION MODE\n========================================");
         _safePrintln("📡 IP: " + WiFi.localIP().toString());
         
         if(MDNS.begin("agvcontrol")) {
             MDNS.addService("http", "tcp", 80);
+            _safePrintln("🔍 mDNS: agvcontrol.local");
         }
         
         _server->begin();
@@ -357,27 +443,38 @@ void AGVController::_startStationMode() {
         
         _safePrintln("========================================\n  SYSTEM READY\n  Default Login: admin / admin123\n========================================\n");
     } else {
+        _safePrintln("\n❌ Failed to connect to WiFi, starting AP mode...");
         _startAPMode();
     }
 }
 
 // ===== UTILITY FUNCTIONS =====
 void AGVController::_loadCredentials() {
-    _prefs.begin("wifi", false);
-    _storedSSID = _prefs.getString("ssid", "");
-    _storedPassword = _prefs.getString("password", "");
-    _prefs.end();
+    Preferences prefs;
+    prefs.begin("wifi", false);
+    _storedSSID = prefs.getString("ssid", "");
+    _storedPassword = prefs.getString("password", "");
+    prefs.end();
+    
+    if (_storedSSID.length() > 0) {
+        _safePrintln("Loaded WiFi credentials for: " + _storedSSID);
+    } else {
+        _safePrintln("No WiFi credentials stored");
+    }
 }
 
 void AGVController::_saveCredentials(const String& ssid, const String& pass) {
-    _prefs.begin("wifi", false);
-    _prefs.putString("ssid", ssid);
-    _prefs.putString("password", pass);
-    _prefs.end();
+    Preferences prefs;
+    prefs.begin("wifi", false);
+    prefs.putString("ssid", ssid);
+    prefs.putString("password", pass);
+    prefs.end();
+    _safePrintln("Saved WiFi credentials for: " + ssid);
 }
 
 String AGVController::_generateSessionToken() {
     String token;
+    randomSeed(micros());
     for(int i = 0; i < 32; i++) {
         token += String(random(0, 16), HEX);
     }
@@ -387,6 +484,13 @@ String AGVController::_generateSessionToken() {
 void AGVController::_safePrintln(const String& msg) {
     if(xSemaphoreTake(_printMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
         Serial.println(msg);
+        xSemaphoreGive(_printMutex);
+    }
+}
+
+void AGVController::_safePrint(const String& msg) {
+    if(xSemaphoreTake(_printMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        Serial.print(msg);
         xSemaphoreGive(_printMutex);
     }
 }
