@@ -13,6 +13,7 @@
 class AGVController {
 public:
     AGVController();
+    void sendToWeb(const String& message);
     void begin();
     
 private:
