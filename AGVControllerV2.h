@@ -13,8 +13,8 @@
 class AGVController {
 public:
     AGVController();
-    void sendToWeb(const String& message);
     void begin();
+    void sendToWeb(const String& message);  // New public method
     
 private:
     static AGVController* _instance;
@@ -25,7 +25,8 @@ private:
     DNSServer* _dnsServer;
     
     // RTOS components
-    QueueHandle_t _serialQueue;
+    QueueHandle_t _webQueue;           // For serial->web messages
+    QueueHandle_t _outgoingWebQueue;   // For user->web messages (new)
     SemaphoreHandle_t _printMutex;
     TaskHandle_t _taskWebHandle;
     TaskHandle_t _taskSerialHandle;
